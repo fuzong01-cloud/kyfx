@@ -1,403 +1,139 @@
-const content = await fetch('/content.json').then(r => {
-  if (!r.ok) throw new Error('复习内容加载失败');
-  return r.json();
-});
+import {emptyState,dayKey,schedule,eligible,normalizeBackup,mergeState} from './progress-model.js';
 
-const $ = selector => document.querySelector(selector);
-const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({
-  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-}[char]));
-const KEY = 'zhihe-progress-v1';
-const modules = content.modules;
-const points = content.syllabus;
-const sourceNames = {
-  'outline341': '341 考试大纲',
-  'outline821': '821 考试大纲',
-  'g-short': '农学概论简化版',
-  'i-short': '农业信息化终极背诵版',
-  'a-short': '人工智能总结'
-};
-const sourceFiles = {
-  'g-short': '农学概论 简化版.docx',
-  'i-short': '农业信息化终极背诵版.pdf',
-  'a-short': '人工智能.docx'
-};
-const questions = buildQuestions();
-let state = loadState();
-let toastTimer;
-let practiceQuestionId = null;
-let answerShown = false;
-let variationShown = false;
-
-function emptyState() {
-  return { version: 1, reviews: {}, drafts: {}, notes: {}, variations: {}, history: [], goal: 12 };
+const $ = (s, root=document)=>root.querySelector(s);
+const esc = v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const KEY='zhigeng-study-v1';
+let data, state=emptyState(), library, questions, topics, sourceMap, syllabusMap, moduleMap, session=null;
+let renderVersion=0, toastTimer, storageFailed=false;
+const labels={direct:'考纲内',related:'相关拓展',retired:'旧纲归档'};
+const paths={home:'学习工作台',module:'模块学习',syllabus:'考纲地图',bank:'题库与真题',question:'题目研习',practice:'主动回忆',library:'资料书架',reading:'资料阅读',progress:'学习记录',sources:'资料依据'};
+const icons={home:'◫',syllabus:'◎',bank:'▤',practice:'▷',library:'▥',progress:'▥',code:'〈/〉',nodes:'✧',leaf:'❧',grid:'▦'};
+const navItems=[['home','学习工作台'],['syllabus','考纲地图'],['bank','题库与真题'],['practice','主动回忆'],['library','资料书架'],['progress','学习记录']];
+const para=t=>String(t||'').split('\n').filter(Boolean).map(p=>`<p>${esc(p)}</p>`).join('');
+const date=t=>new Date(t).toLocaleDateString('zh-CN',{month:'short',day:'numeric'});
+const url=(route,params={})=>`#${route}${Object.keys(params).length?'?'+new URLSearchParams(params):''}`;
+const tag=(text,cls='')=>`<span class="tag ${cls}">${esc(text)}</span>`;
+const statusTag=q=>tag(labels[q.status],q.status);
+const button=(label,action,extra='',cls='button')=>`<button class="${cls}" data-action="${action}" ${extra}>${label}</button>`;
+const link=(label,href,cls='button secondary')=>`<a class="${cls}" href="${esc(href)}">${label}</a>`;
+const empty=(title,text,action='')=>`<div class="empty"><span>❧</span><h2>${title}</h2><p>${text}</p>${action}</div>`;
+function toast(message){$('#toast').textContent=message;$('#toast').classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.remove('show'),4000);}
+function save(){try{localStorage.setItem(KEY,JSON.stringify(state));storageFailed=false;}catch{storageFailed=true;toast('浏览器存储不可用或已满，请立即导出备份。');}}
+function reviewed(id){return Boolean(state.reviews[id]);}
+function mastered(id){const r=state.reviews[id];return Boolean(r&&r.quality>=2&&r.stage>=3);}
+function due(id){return state.reviews[id]?.due<=Date.now();}
+function todayHistory(){return state.history.filter(h=>dayKey(h.at)===dayKey());}
+function progressBar(value,total){return `<progress value="${value}" max="${Math.max(total,1)}" aria-label="已学习 ${value}，共 ${total}"></progress>`;}
+function head(kicker,title,description,action=''){return `<div class="page-heading"><div><div class="eyebrow">${kicker}</div><h1>${title}</h1><p>${description}</p></div>${action}</div>`;}
+function moduleCards(){return `<div class="module-grid">${data.modules.map(m=>{
+ const qs=data.questions.filter(q=>q.module===m.id&&eligible(q)), done=qs.filter(q=>reviewed(q.id)).length;
+ return `<a class="module-card ${m.color}" href="#module/${m.id}"><div class="module-top"><span class="module-icon">${icons[m.icon]}</span><span>${m.code} <b>↗</b></span></div><h3>${m.title}</h3><p>${m.description}</p><div class="module-progress"><span>${data.topics.filter(t=>t.module===m.id).length} 个主题 · ${m.score}</span><b>${Math.round(done/Math.max(qs.length,1)*100)}%</b></div>${progressBar(done,qs.length)}</a>`;
+ }).join('')}</div>`;}
+function questionList(qs,limit=Infinity){return qs.length?`<div class="question-list">${qs.slice(0,limit).map(q=>`<a class="question-row" href="#question/${q.id}"><span class="question-marker ${mastered(q.id)?'mastered':reviewed(q.id)?'seen':''}">${mastered(q.id)?'✓':reviewed(q.id)?'·':'○'}</span><div class="question-copy"><div class="tag-row">${tag(moduleMap[q.module]?.short||'旧341')}${statusTag(q)}${tag(q.year?`${q.year} 回忆` : q.kind,'subtle')}</div><h3>${esc(q.prompt)}</h3><p>${esc(q.syllabusIds.join(' · ')||'无现行考纲对应项')}${state.bookmarks.includes(q.id)?' · 已收藏':''}</p></div><span class="arrow">↗</span></a>`).join('')}</div>`:empty('这里暂时没有题目','换一个筛选条件，或先到题库开始学习。');}
+function activity(){const days=Array.from({length:7},(_,i)=>{const d=new Date();d.setDate(d.getDate()-(6-i));const key=dayKey(d);return {d,key,n:state.history.filter(h=>dayKey(h.at)===key).length};});const max=Math.max(state.goal,...days.map(x=>x.n));
+ return `<div class="activity" aria-label="最近七天复习次数">${days.map(x=>`<div class="activity-day"><b>${x.n||'·'}</b><meter min="0" max="${max}" value="${x.n}" aria-label="${x.key} 复习${x.n}次"></meter><span>${x.key===dayKey()?'今天':`${x.d.getMonth()+1}/${x.d.getDate()}`}</span></div>`).join('')}</div>`;}
+function renderHome(){const active=data.questions.filter(eligible),seen=active.filter(q=>reviewed(q.id)).length, masteredCount=active.filter(q=>mastered(q.id)).length, pending=active.filter(q=>due(q.id)).length;const today=todayHistory().length;
+ return `${head('YOUR STUDY SPACE','今天，也向前一步。','把知识串起来，让每一次复习都有依据。',`<span class="date-pill">${new Date().toLocaleDateString('zh-CN',{month:'long',day:'numeric',weekday:'long'})}</span>`)}
+ <div class="hero"><div class="hero-copy"><span class="hero-label">2027 · 农业信息化备考</span><h2>从一道题，<br>读懂一个考点。</h2><p>学生笔记打底，最新提供的考纲定范围。<br>先回忆，再核对，最后换个场景想一遍。</p><div class="hero-actions">${link('开始今日复习 <span>→</span>','#practice','button light')}${link('查看考纲地图 ↗','#syllabus','hero-link')}</div></div><div class="hero-art" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><img class="sprout" src="/sprout.svg" alt=""><div class="art-label">理解 / 联结 / 记忆</div></div><div class="hero-footer"><span>341 <b>程序 · 人工智能 · 农学</b></span><span>821 <b>现代农业与农业信息化</b></span></div></div>
+ <div class="stats-grid"><div class="stat"><span>今日复习</span><strong>${today}<small> / ${state.goal}</small></strong><p>${today>=state.goal?'今日目标已完成，继续巩固也很好。':'每一次主动回忆，都算一步。'}</p></div><div class="stat"><span>到期复习</span><strong>${pending}<small> 道</small></strong><p>已到安排时间的题目</p></div><div class="stat"><span>已学习</span><strong>${seen}<small> / ${active.length}</small></strong><p>考纲内题目 · 已自评</p></div><div class="stat"><span>稳定掌握</span><strong>${masteredCount}<small> 道</small></strong><p>间隔阶段≥3，最近自评会答</p></div></div>
+ <div class="section-heading"><h2>四个模块，一张知识地图</h2><a href="#syllabus">查看全部考点 →</a></div>${moduleCards()}
+ <div class="bottom-grid"><section class="panel"><div class="section-heading"><h2>这周的积累</h2><span class="muted">按复习次数统计</span></div>${activity()}</section><section class="panel note-panel"><span class="eyebrow">复习路径</span><h2>理解 → 回忆 → 迁移</h2><ol class="steps"><li><b>01</b><span>读模块要点，对照学生原笔记。</span></li><li><b>02</b><span>遮住答案，自己组织语言或写代码。</span></li><li><b>03</b><span>做一道变式，自评后安排下次复习。</span></li></ol></section></div>
+ <div class="notice">${esc(data.meta.scopeNote)} <a href="#sources">查看资料依据 →</a></div>`;
 }
-
-function buildQuestions() {
-  const generated = [];
-  for (const point of points) {
-    generated.push({
-      id: `outline-${point.id}`,
-      kind: '考纲主动回忆',
-      module: point.module,
-      pointId: point.id,
-      syllabusIds: [point.id],
-      noteIds: content.notes.filter(note => (content.noteMappings[note.id] || []).includes(point.id)).map(note => note.id),
-      sourceId: point.module === 'information' ? 'outline821' : 'outline341',
-      prompt: `请回忆「${point.section}」的考试要求，并说清这一条考查哪些知识内容。`,
-      answer: point.text,
-      variationPrompt: variationPrompt(point.module, point.section),
-      variationGuide: '先判断新情境对应的考纲概念，再按“条件与目标 → 方法选择 → 实施或分析 → 效果与限制”组织答案。请用模块总结里的具体内容补充，不要只写空泛结论。'
-    });
-  }
-  for (const note of content.notes) {
-    const syllabusIds = content.noteMappings[note.id] || [];
-    if (!syllabusIds.length) continue;
-    generated.push({
-      id: `summary-${note.id}`,
-      kind: '学生总结主动回忆',
-      module: note.module,
-      pointId: syllabusIds[0],
-      syllabusIds,
-      noteIds: [note.id],
-      sourceId: note.source,
-      prompt: `请合上材料，复述「${note.title}」的核心内容，并说明它对应考纲的哪些要求。`,
-      answer: note.text,
-      variationPrompt: variationPrompt(note.module, note.title),
-      variationGuide: '尝试换一个作物、生产条件或农业应用场景。说明哪些原理仍适用、哪些措施需要随条件调整，并指出判断依据。'
-    });
-  }
-  return generated;
+function renderModule(id){const m=moduleMap[id];if(!m)return empty('模块不存在','请选择一个学习模块。',link('回到工作台','#home'));const ts=data.topics.filter(t=>t.module===id);const qs=data.questions.filter(q=>q.module===id&&eligible(q));
+ return `${head(m.code+' / MODULE',esc(m.title),`${ts.length} 个主题 · ${qs.length} 道考纲内练习 · ${m.score}`,link('开始本模块回忆 →',url('practice',{module:id}),'button'))}
+ <div class="notice">每个主题先看“答题骨架”，再读学生资料补充展开。<a href="${url('library',{module:id})}">打开本模块资料 →</a></div>
+ <div class="topic-grid">${ts.map((t,i)=>`<article class="topic-card"><div class="topic-top"><span class="topic-number">${String(i+1).padStart(2,'0')}</span><span class="tag-row">${t.syllabusIds.map(s=>tag(s)).join('')}</span></div><h2>${esc(t.title)}</h2><p>${esc(t.prompt)}</p><ul class="essentials">${t.essentials.map(p=>`<li>${esc(p)}</li>`).join('')}</ul><div class="pitfall"><b>易错提醒</b>${esc(t.pitfall)}</div><div class="topic-actions">${link('学会这一题 →','#question/learn-'+t.id)}${link('2 道举一反三',url('bank',{topic:t.id,kind:'新编变式'}),'text-link')}</div></article>`).join('')}</div>`;
 }
-
-function variationPrompt(moduleId, title) {
-  const context = {
-    program: '输入数据或程序条件',
-    ai: '数据类型或实际任务',
-    agronomy: '作物、季节或田间条件',
-    information: '农业生产场景或管理目标'
-  }[moduleId] || '应用场景';
-  return `把「${title}」换到另一个${context}中，你会如何迁移所学内容？`;
+function renderSyllabus(params){const filter=params.get('module')||'';return `${head('SYLLABUS MAP','每道题，都有来处。','保留考纲原文，区分直接对应、相关拓展和旧纲内容。')}
+ <form class="filters" id="syllabus-filter"><label>模块<select name="module">${moduleOptions(filter)}</select></label><button class="button secondary">筛选</button></form>
+ <div class="legend">${tag('考纲内','direct')}<span>直接训练条款要求</span>${tag('相关拓展','related')}<span>联系背景，按需学习</span>${tag('旧纲归档','retired')}<span>不进入默认复习队列</span></div>
+ ${data.syllabus.filter(s=>!filter||s.module===filter).map(s=>{const ts=data.topics.filter(t=>t.syllabusIds.includes(s.id));const qs=data.questions.filter(q=>q.syllabusIds.includes(s.id)&&eligible(q));return `<section class="syllabus-card"><div class="syllabus-id">${s.id}<small>${moduleMap[s.module].short}</small></div><div class="syllabus-content"><div class="section-heading"><h2>${esc(s.section)}</h2><span>${qs.length} 道对应练习</span></div><blockquote>${esc(s.text)}</blockquote><div class="topic-links">${ts.map(t=>link(esc(t.title),'#question/learn-'+t.id,'topic-chip')).join('')}</div><div class="syllabus-footer"><span>${qs.filter(q=>reviewed(q.id)).length} 道已学习 · ${qs.filter(q=>mastered(q.id)).length} 道稳定掌握</span>${link('查看对应题目 →',url('bank',{syllabus:s.id}),'text-link')}</div></div></section>`;}).join('')}
+ <div class="notice">题目数量表示已有训练覆盖，不能代表考纲所有细节已充分讲解。${link('查看旧纲归档 →',url('bank',{status:'retired'}),'text-link')}</div>`;}
+function moduleOptions(value){return `<option value="">全部模块</option>`+data.modules.map(m=>`<option value="${m.id}" ${value===m.id?'selected':''}>${m.code} ${m.title}</option>`).join('');}
+function selectOptions(items,value){return items.map(([v,t])=>`<option value="${esc(v)}" ${value===String(v)?'selected':''}>${esc(t)}</option>`).join('');}
+function renderBank(params){const mod=params.get('module')||'', status=params.get('status')??'direct', year=params.get('year')||'',kind=params.get('kind')||'', search=params.get('q')||'',filter=params.get('filter')||'',topic=params.get('topic')||'',syllabus=params.get('syllabus')||'';
+ const qs=data.questions.filter(q=>(!mod||q.module===mod)&&(!status||q.status===status)&&(!year||String(q.year)===year)&&(!kind||q.kind===kind)&&(!topic||q.topicIds.includes(topic))&&(!syllabus||q.syllabusIds.includes(syllabus))&&(!search||`${q.prompt} ${q.answer} ${q.syllabusIds.join(' ')} ${q.topicIds.map(id=>topics[id]?.title).join(' ')}`.toLowerCase().includes(search.toLowerCase()))&&(!filter||filter==='bookmarks'&&state.bookmarks.includes(q.id)||filter==='weak'&&state.reviews[q.id]?.quality<2||filter==='due'&&due(q.id)));
+ const page=Math.max(1,Math.min(Number(params.get('page'))||1,Math.ceil(qs.length/20)||1));
+ const pageUrl=n=>{const p=new URLSearchParams(params);p.set('page',n);return '#bank?'+p;};
+ return `${head('QUESTION BANK','一道题，连起一片知识。','先按最新提供的考纲筛选，再用回忆题与新编变式练习。',link('主动回忆 →','#practice','button'))}
+ <form class="filters bank-filters" id="bank-filter"><label class="search-field">搜索<input type="search" name="q" id="bank-search" value="${esc(search)}" placeholder="题目、答案关键词或考点编号"></label><label>模块<select name="module">${moduleOptions(mod)}</select></label><label>范围<select name="status">${selectOptions([['direct','考纲内'],['related','相关拓展'],['retired','旧纲归档'],['','全部范围']],status)}</select></label><label>年份<select name="year">${selectOptions([['','全部年份'],...[2026,2025,2024,2023,2022].map(y=>[y,y+' 回忆'])],year)}</select></label><label>题目类型<select name="kind">${selectOptions([['','全部类型'],...new Set(data.questions.map(q=>q.kind))].map(x=>Array.isArray(x)?x:[x,x]),kind)}</select></label><label>学习状态<select name="filter">${selectOptions([['','全部状态'],['bookmarks','我的收藏'],['weak','待巩固'],['due','到期复习']],filter)}</select></label>${topic?`<input type="hidden" name="topic" value="${esc(topic)}">`:''}${syllabus?`<input type="hidden" name="syllabus" value="${esc(syllabus)}">`:''}<button class="button">筛选题目</button>${link('重置','#bank','text-link')}</form>
+ <div class="section-heading"><h2>${qs.length} 道题${topic?' · '+esc(topics[topic]?.title):''}${syllabus?' · '+esc(syllabus):''}</h2><span class="muted">○ 未学 · 绿点已学 · ✓ 稳定掌握</span></div>${status==='retired'?'<div class="notice">旧计算机网络、数据库专题仅保留题目和排除依据，不纳入默认复习。编程题仍按新纲逐题保留。</div>':''}${questionList(qs.slice((page-1)*20,page*20))}
+ ${qs.length>20?`<div class="pagination">${page>1?link('← 上一页',pageUrl(page-1)):''}<span>${page} / ${Math.ceil(qs.length/20)}</span>${page*20<qs.length?link('下一页 →',pageUrl(page+1)):''}</div>`:''}`;
 }
-
-function loadState() {
-  try {
-    const stored = JSON.parse(localStorage.getItem(KEY));
-    if (!stored || stored.version !== 1) return emptyState();
-    return { ...emptyState(), ...stored };
-  } catch {
-    return emptyState();
-  }
+function sourceLinks(ids){return [...new Set(ids||[])].filter(id=>sourceMap[id]).map(id=>`<a href="#sources/${id}">${esc(sourceMap[id].name)}</a>`).join('<span> / </span>');}
+function mapping(q){return `<section class="panel mapping-panel"><div class="section-heading"><h2>对应考纲</h2>${statusTag(q)}</div><p class="muted">${esc(q.mappingReason)}</p>${q.syllabusIds.map(id=>{const s=syllabusMap[id];return s?`<details><summary><b>${id}</b> ${esc(s.section)}</summary><blockquote>${esc(s.text)}</blockquote></details>`:'';}).join('')||'<p>最新提供的考纲中无直接对应条目。</p>'}</section>`;}
+function evidenceNotes(q){return q.topicIds.flatMap(id=>topics[id]?.evidence||[]).map(e=>`<div class="evidence-note"><b>辅助核对 · ${esc(sourceMap[e.source].name)}</b><span>${esc(e.location)}</span><p>${esc(e.note)}</p></div>`).join('');}
+function answer(q){return `<div class="answer-body"><div class="eyebrow">参考要点 · 整理解析</div>${para(q.answer)}${q.options?`<p class="correct-answer">参考选项：${String.fromCharCode(65+q.correct)} · ${esc(q.options[q.correct])}</p>`:''}</div>${q.topicIds.map(id=>topics[id]).filter(Boolean).map(t=>`<div class="pitfall"><b>${esc(t.title)} · 易错点</b>${esc(t.pitfall)}</div>${t.code?`<details class="code-details"><summary>查看 Java 示例代码</summary><pre><code>${esc(t.code)}</code></pre></details>`:''}`).join('')}${evidenceNotes(q)}<p class="fine-print">根据学生资料重组与补充，非官方标准答案。主观题请按要点自行核对，系统不自动判分。</p>`;}
+function grading(id){return `<div class="grading"><div><b>核对后，你能独立答到哪一步？</b><small>选择会保存本次记录，并安排下一次复习。</small></div><div class="grade-buttons">${['还不会','有点模糊','基本会答','能举一反三'].map((s,i)=>button(s,'grade',`data-id="${id}" data-quality="${i}"`,'grade grade-'+i)).join('')}</div></div>`;}
+function renderQuestion(id){const q=questions[id];if(!q)return empty('没有找到这道题','请从题库重新选择。',link('打开题库','#bank'));const r=state.reviews[id];
+ return `${head('QUESTION / '+esc(id),esc(moduleMap[q.module]?.title||'旧纲题目'),`${q.year?q.year+'年回忆 · ':''}${q.kind}`,button(state.bookmarks.includes(id)?'★ 已收藏':'☆ 收藏','bookmark',`data-id="${id}"`,'button secondary'))}
+ <div class="study-layout"><div><section class="panel question-panel"><div class="tag-row">${statusTag(q)}${tag(q.provenance,'subtle')}${r?tag('下次复习 '+date(r.due),'subtle'):''}</div><h2 class="question-title">${esc(q.prompt)}</h2>${q.options?`<ol class="static-options" type="A">${q.options.map(o=>`<li>${esc(o)}</li>`).join('')}</ol>`:''}<div class="notice compact">${esc(q.note)}</div>
+ ${q.status!=='retired'?`<label class="field-label" for="answer-draft">先试着写下思路</label><textarea id="answer-draft" data-save="drafts" data-id="${id}" rows="6" maxlength="15000" placeholder="定义 → 原理 → 方法 → 场景 → 局限。先回忆，再展开答案。">${esc(state.drafts[id]||'')}</textarea><div class="autosave-label">自动保存在当前浏览器</div>`:''}
+ <details class="answer-details" ${q.status==='retired'?'open':''}><summary>${q.status==='retired'?'排除依据':'展开参考答案与易错点'}</summary>${answer(q)}${eligible(q)?grading(id):''}</details></section>
+ ${q.topicIds.length?`<section class="panel"><div class="section-heading"><h2>举一反三</h2><span class="muted">更换条件，训练迁移</span></div>${q.topicIds.map(id=>topics[id]).filter(Boolean).map(t=>`<h3>${esc(t.title)}</h3>${t.variations.map((v,i)=>`<details class="variation"><summary>${esc(v.question)}</summary>${para(v.answer)}${link('加入主动回忆 →',url('practice',{question:`variant-${t.id}-${i+1}`}),'text-link')}</details>`).join('')}`).join('')}</section>`:''}
+ </div><aside class="study-aside">${mapping(q)}<section class="panel"><h2>我的记忆线索</h2><textarea data-save="notes" data-id="${id}" rows="5" maxlength="15000" aria-label="我的记忆线索" placeholder="用自己的话记录口诀、错因或例子。">${esc(state.notes[id]||'')}</textarea><span class="autosave-label">自动保存</span></section><section class="panel source-card"><h2>资料依据</h2>${sourceLinks(q.sources)}<p class="fine-print">学生总结为主；回忆题存在缺漏。原笔记中的答案不等于已校正答案。</p>${link('查阅学生原笔记 →',url('library',{module:q.module}),'text-link')}</section></aside></div>`;
 }
-
-function saveState() {
-  try {
-    localStorage.setItem(KEY, JSON.stringify(state));
-  } catch {
-    toast('浏览器存储空间不足，请先导出备份。');
-  }
+function startSession(params){const module=params.get('module')||'',mode=params.get('mode')||'daily',single=params.get('question');let pool=data.questions.filter(q=>eligible(q)&&(!module||q.module===module));
+ if(single)pool=pool.filter(q=>q.id===single);
+ else if(mode==='weak')pool=pool.filter(q=>state.reviews[q.id]?.quality<2);
+ else if(mode==='bookmarks')pool=pool.filter(q=>state.bookmarks.includes(q.id));
+ else if(mode==='due')pool=pool.filter(q=>due(q.id));
+ else pool=pool.filter(q=>due(q.id)||!reviewed(q.id));
+ pool.sort((a,b)=>{const ar=state.reviews[a.id],br=state.reviews[b.id];return (ar?0:1)-(br?0:1)||(ar?.due||0)-(br?.due||0);});
+ session={signature:params.toString(),ids:pool.slice(0,single?1:state.goal).map(q=>q.id),index:0,reveal:false,selected:null,grades:[],mode};
 }
-
-function toast(message) {
-  $('#toast').textContent = message;
-  $('#toast').classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => $('#toast').classList.remove('show'), 3200);
+function renderPractice(params){if(!session||session.signature!==params.toString())startSession(params);const q=questions[session.ids[session.index]];const title=head('ACTIVE RECALL','先想一遍，再看答案。','考纲内题目按“到期优先、新题随后”安排。每次最多取每日目标数量。');
+ const modes=`<div class="practice-modes">${[['daily','今日计划'],['due','只复习到期'],['weak','待巩固'],['bookmarks','收藏题']].map(([v,t])=>link(t,url('practice',{mode:v,...(params.get('module')?{module:params.get('module')}: {})}),session.mode===v?'pill active':'pill')).join('')}${params.get('module')?tag(moduleMap[params.get('module')]?.title):''}</div>`;
+ if(!q)return title+modes+empty(session.ids.length?'本轮完成，给知识一点沉淀的时间。':'这组题目暂时为空。',session.ids.length?`已完成 ${session.grades.length} 道。忘记的题目会在 10 分钟后再次到期；其他题目按间隔复习。`:'可以学习新题，或到题库收藏想重点练习的内容。',button('重新生成今日计划','restart')+' '+link('返回题库','#bank'));
+ const checked=session.reveal&&q.options;
+ return title+modes+`<div class="practice-counter"><span>本轮 ${session.index+1} / ${session.ids.length}</span><span>${esc(moduleMap[q.module]?.title)} · ${q.syllabusIds.join(' / ')}</span></div>${progressBar(session.index,session.ids.length)}
+ <section class="panel practice-card"><div class="tag-row">${statusTag(q)}${tag(q.year?q.year+' 回忆':q.kind,'subtle')}${button(state.bookmarks.includes(q.id)?'★ 已收藏':'☆ 收藏','bookmark',`data-id="${q.id}"`,'bookmark-small')}</div><h2>${esc(q.prompt)}</h2><p class="fine-print">${esc(q.note)}</p>
+ ${q.options?`<div class="choices">${q.options.map((o,i)=>`<button class="choice ${session.selected===i?'selected':''} ${checked?(i===q.correct?'correct':session.selected===i?'incorrect':''):''}" data-action="choose" data-index="${i}" ${checked?'disabled':''} aria-pressed="${session.selected===i}"><b>${String.fromCharCode(65+i)}</b>${esc(o)}</button>`).join('')}</div>${checked?`<p class="choice-result">${session.selected===q.correct?'本题选对了，再解释一下选择理由。':session.selected===null?'已跳过选择，请核对参考选项。':'本题选项不符，请核对概念和错因。'}</p>`:''}`:`<label class="field-label" for="practice-draft">我的答题思路</label><textarea id="practice-draft" data-save="drafts" data-id="${q.id}" rows="7" maxlength="15000" placeholder="尽量不查资料，写下你记得的要点。">${esc(state.drafts[q.id]||'')}</textarea>`}
+ ${session.reveal?`<div class="revealed">${answer(q)}${grading(q.id)}</div>`:`<div class="reveal-actions">${button('完成回忆，核对答案 ↓','reveal')}${link('查看考纲与来源 ↗','#question/'+q.id,'text-link')}</div>`}</section>`;
 }
-
-function moduleById(id) { return modules.find(item => item.id === id); }
-function pointById(id) { return points.find(item => item.id === id); }
-function questionById(id) { return questions.find(item => item.id === id); }
-function questionsForPoint(id) { return questions.filter(item => item.syllabusIds.includes(id)); }
-function pointNotes(id) {
-  return content.notes.filter(note => (content.noteMappings[note.id] || []).includes(id));
+async function getLibrary(){if(!library){const r=await fetch('/content/library.json');if(!r.ok)throw new Error('资料加载失败');library=await r.json();}return library;}
+async function renderLibrary(params){await getLibrary();const mod=params.get('module')||'',search=params.get('q')||'',src=params.get('source')||'';const sections=library.filter(s=>(!mod||s.module===mod)&&(!src||s.source===src)&&(!search||`${s.title} ${s.text}`.toLowerCase().includes(search.toLowerCase())));
+ return `${head('READING LIBRARY','把资料放在同一张书桌。','保留学生总结的原始章节，配合模块要点理解与展开。')}
+ <div class="notice">原笔记中可能存在错误、过时表述和 AI 生成痕迹；“高频”“必考”是原作者用语。以下为阅读材料，不等于已经逐段核准的答案。</div>
+ <form class="filters" id="library-filter"><label class="search-field">搜索原文<input type="search" name="q" value="${esc(search)}" placeholder="例如：轮作、卷积、园区规划"></label><label>模块<select name="module">${moduleOptions(mod)}</select></label><label>来源<select name="source">${selectOptions([['','全部学生资料'],...[...new Set(library.map(s=>s.source))].map(id=>[id,sourceMap[id].name])],src)}</select></label><button class="button">查找资料</button></form>
+ <div class="section-heading"><h2>${sections.length} 个章节</h2><span class="muted">教材以本地原书辅助查阅</span></div><div class="reading-grid">${sections.map(s=>`<a class="reading-card" href="#reading/${s.id}"><span class="book-icon">▥</span><div class="tag-row">${tag(moduleMap[s.module].short)}${tag(sourceMap[s.source].role,'subtle')}</div><h2>${esc(s.title)}</h2><p>${esc(search?excerpt(s.text,search):s.text.slice(0,110))}…</p><div class="reading-meta">${esc(sourceMap[s.source].name)}<span>${Math.round(s.text.length/100)/10} 千字 ↗</span></div></a>`).join('')}</div>${sections.length?'':empty('没有匹配的资料','试着缩短关键词。')}`;
 }
-function modulePoints(id) { return points.filter(point => point.module === id); }
-function dueQuestions() {
-  const now = Date.now();
-  return questions.filter(question => {
-    const review = state.reviews[question.id];
-    return !review || review.due <= now;
-  });
-}
-function reviewState(questionId) { return state.reviews[questionId]; }
-function pointStatus(pointId) {
-  const related = questionsForPoint(pointId);
-  if (!related.length) return 0;
-  if (related.every(question => reviewState(question.id)?.quality >= 2)) return 2;
-  if (related.some(question => reviewState(question.id))) return 1;
-  return 0;
-}
-function statusName(value) { return ['未开始', '正在复习', '已掌握'][value] || '未开始'; }
-function statusPill(pointId) {
-  const status = pointStatus(pointId);
-  return `<span class="status status-${status}">${statusName(status)}</span>`;
-}
-function head(kicker, title, description, action = '') {
-  return `<div class="page-heading"><div><div class="eyebrow">${kicker}</div><h1>${title}</h1><p>${description}</p></div>${action}</div>`;
-}
-function button(label, action, id = '', extra = '', klass = 'button') {
-  return `<button type="button" class="${klass}" data-action="${action}" ${id ? `data-id="${esc(id)}"` : ''} ${extra}>${label}</button>`;
-}
-function empty(title, description, action = '') {
-  return `<div class="empty"><span>❧</span><h2>${title}</h2><p>${description}</p>${action}</div>`;
-}
-function sourceLabel(sourceId) { return sourceFiles[sourceId] || sourceNames[sourceId] || '考纲范围整理'; }
-function cardCount(pointId) { return questionsForPoint(pointId).length; }
+function excerpt(text,search){const i=text.toLowerCase().indexOf(search.toLowerCase());return text.slice(Math.max(0,i-30),Math.max(0,i-30)+160);}
+async function renderReading(id){await getLibrary();const s=library.find(x=>x.id===id);if(!s)return empty('未找到章节','请从资料书架重新打开。',link('资料书架','#library'));return `${head('STUDENT NOTES',esc(s.title),esc(sourceMap[s.source].name),link('本模块学习 →','#module/'+s.module))}<div class="notice">${esc(s.notice)}</div><div class="reader-toolbar"><span>${s.text.length.toLocaleString()} 字符 · 可用浏览器查找定位原文</span>${button('打印此章节','print','','button secondary')}</div><article class="reader">${para(s.text)}</article>`;}
+function renderProgress(){const active=data.questions.filter(eligible), weak=active.filter(q=>state.reviews[q.id]?.quality<2), bookmarks=active.filter(q=>state.bookmarks.includes(q.id));return `${head('YOUR PROGRESS','让积累，看得见。','记录属于当前浏览器。换设备或清理浏览器前，请先导出备份。')}
+ <div class="bottom-grid"><section class="panel"><div class="section-heading"><h2>最近七天</h2><span>${state.history.length} 次累计复习</span></div>${activity()}</section><section class="panel"><h2>每日目标</h2><p class="muted">建议以能认真回忆、核对的数量为准。</p><form id="goal-form" class="goal-form"><label for="goal">每天复习</label><input type="number" id="goal" name="goal" min="1" max="100" required value="${state.goal}"><span>道</span><button class="button secondary">保存目标</button></form><p class="fine-print">今日已自评 ${todayHistory().length} 次。重复复习会计入次数。</p></section></div>
+ <section class="panel backup-panel"><div><h2>把学习记录随身带走</h2><p>备份包含自评、草稿、笔记、收藏。导入时合并记录，保留较新的复习进度，已有笔记优先。</p>${storageFailed?'<p class="error">当前浏览器存储不可用，请立即备份。</p>':''}</div><div class="button-row">${button('↓ 导出备份','export')}${button('↑ 导入备份','import','','button secondary')}</div></section>
+ ${moduleCards()}<div class="bottom-grid"><section class="panel"><div class="section-heading"><h2>待巩固 <span class="count">${weak.length}</span></h2>${link('开始巩固 →',url('practice',{mode:'weak'}),'text-link')}</div>${questionList(weak,5)}${weak.length>5?link('查看全部 →',url('bank',{filter:'weak'}),'text-link'):''}</section><section class="panel"><div class="section-heading"><h2>我的收藏 <span class="count">${bookmarks.length}</span></h2>${link('查看全部 →',url('bank',{filter:'bookmarks'}),'text-link')}</div>${questionList(bookmarks,5)}</section></div>
+ <section class="panel"><h2>间隔复习怎样安排</h2><p>“还不会”在10分钟后重现；“有点模糊”保持当前阶段；“基本会答”前进一阶段；“能举一反三”前进两阶段。各阶段间隔为1、1、3、7、14、30天。</p><p class="muted">这是用于学习安排的简化规则。稳定掌握表示阶段达到3且最近自评会答，不等于真实考试分数。系统不会发通知，到期题在下次打开网站时显示。</p></section>`;}
+function renderSources(id){return `${head('SOURCES & SCOPE','知道依据，才能放心复习。','考纲控制范围，学生总结提供主体，教材用于辅助理解与核查。')}
+ <div class="button-row downloads"><a class="button secondary" href="/study-guide.md" download="知禾模块复习提纲.md">↓ 下载模块提纲</a><a class="button secondary" href="/question-index.md" download="题目与考纲对照索引.md">↓ 下载题目考纲索引</a></div><section class="panel policy-panel"><h2>这套资料怎样使用</h2><ol><li>${esc(data.meta.scopeNote)}</li><li>${esc(data.meta.policy)}</li><li>2026年是341人工智能首次纳入考试；更早的回忆题只按与最新考纲的对应关系保留，旧网络和数据库题归档。821旧题也按最新821考纲判断，不把题目出现过等同于考纲要求。</li><li>回忆版可能缺题、缺选项或记错年份。明确缺失处保留提示；新编题和重构题单独标注，不补写为原题。</li><li>学生原笔记在“资料书架”保留。模块要点、解析和变式经过重新组织，尚不等于全部原笔记逐题校订。</li><li>资料书架只收录两份最新考纲、三份学生总结和两本辅助教材。教材仅用于选定概念核对，不发布原书文件。</li></ol></section>
+ <div class="section-heading"><h2>资料清单</h2><span class="muted">${data.sources.length} 项 · 内容更新 ${esc(data.meta.updated)}</span></div><div class="sources-list">${data.sources.map(s=>`<article class="source-item ${id===s.id?'highlight':''}" id="source-${s.id}"><div class="source-icon">${s.role.includes('考纲')?'◎':'▥'}</div><div><div class="tag-row">${tag(s.role)}${s.year?tag(s.year+'年','subtle'):''}</div><h2>${esc(s.name)}</h2><p>${esc(s.note)}</p>${['g-short','i-short','a-short'].includes(s.id)?link('阅读学生资料 →',url('library',{source:s.id}),'text-link'):''}</div></article>`).join('')}</div>`;}
 
-function moduleCard(module) {
-  const modulePointsList = modulePoints(module.id);
-  const mastered = modulePointsList.filter(point => pointStatus(point.id) === 2).length;
-  const due = questions.filter(question => question.module === module.id && dueQuestions().some(item => item.id === question.id)).length;
-  const index = modules.indexOf(module);
-  return `<a class="module-card ${['green', 'blue', 'gold', 'terra'][index]}" href="#module/${module.id}">
-    <div class="module-top"><span class="module-icon">${['〈/〉', '✧', '❧', '▦'][index]}</span><span>${esc(module.code)} <b>↗</b></span></div>
-    <h3>${esc(module.title)}</h3><p>${esc(module.description)}</p>
-    <div class="module-progress"><span>${modulePointsList.length} 个考纲点 · ${questions.filter(q => q.module === module.id).length} 道练习</span><b>${Math.round(mastered / Math.max(modulePointsList.length, 1) * 100)}%</b></div>
-    <progress value="${mastered}" max="${Math.max(modulePointsList.length, 1)}"></progress>
-    <small class="due-line">${due} 道待开始或复习</small></a>`;
+async function render(){const version=++renderVersion;const raw=location.hash.slice(1)||'home';const [path,query='']=raw.split('?');const [route,id]=path.split('/');const params=new URLSearchParams(query);if(route!=='practice')session=null;
+ $('#sidebar').classList.remove('open');$('#menu-toggle').setAttribute('aria-expanded','false');
+ $('#nav').innerHTML=navItems.map(([p,title])=>`<a href="#${p}" class="${route===p||p==='bank'&&route==='question'||p==='library'&&route==='reading'?'active':''}" ${route===p?'aria-current="page"':''}><span class="nav-icon">${icons[p]}</span>${title}${p==='practice'?'<span class="nav-dot"></span>':''}</a>`).join('');
+ $('#breadcrumb').textContent=paths[route]||'学习工作台';document.title=(paths[route]||'学习工作台')+' · 知禾2027';
+ try{let html;switch(route){case'home':case'main':html=renderHome();break;case'module':html=renderModule(id);break;case'syllabus':html=renderSyllabus(params);break;case'bank':html=renderBank(params);break;case'question':html=renderQuestion(id);break;case'practice':html=renderPractice(params);break;case'library':html=await renderLibrary(params);break;case'reading':html=await renderReading(id);break;case'progress':html=renderProgress();break;case'sources':html=renderSources(id);break;default:html=empty('这一页还没有种下。','回到工作台继续学习。',link('返回工作台','#home'));}
+ if(version!==renderVersion)return;$('#main').innerHTML=html;window.scrollTo(0,0);if(route==='sources'&&id)document.getElementById('source-'+id)?.scrollIntoView({block:'center'});
+ }catch(error){if(version===renderVersion)$('#main').innerHTML=empty('页面暂时无法加载',esc(error.message),button('重新加载','reload'));}
 }
-
-function renderHome() {
-  const due = dueQuestions().length;
-  const mastered = points.filter(point => pointStatus(point.id) === 2).length;
-  const today = state.history.filter(item => new Date(item.at).toDateString() === new Date().toDateString()).length;
-  return `${head('2027 · 备考工作台', '把考纲变成每天能完成的复习。', '每个考点都有对应练习：先自己作答，再核对总结与考纲，最后按掌握程度安排复习。', `<span class="date-pill">${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })}</span>`)}
-    <section class="hero"><div class="hero-copy"><span class="hero-label">341 · 821 STUDY PLAN</span><h2>先回忆，再核对，<br>最后举一反三。</h2><p>按考纲分模块练习。<br>上届总结做答案底稿，教材帮助核对关键概念。</p><div class="hero-actions"><a class="button light" href="#practice">开始今日复习 →</a><a class="hero-link" href="#syllabus">查看考纲地图 ↗</a></div></div>
-    <div class="hero-art" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><img class="sprout" src="/sprout.svg" alt=""><div class="art-label">回忆 / 核对 / 巩固</div></div>
-    <div class="hero-footer"><span>341 <b>程序 · 人工智能 · 农学概论</b></span><span>821 <b>现代农业与农业信息化</b></span></div></section>
-    <div class="stats-grid"><div class="stat"><strong>${due}</strong><p>待开始 / 复习练习</p></div><div class="stat"><strong>${questions.length}</strong><p>考纲与总结练习</p></div><div class="stat"><strong>${mastered}</strong><p>已掌握考点</p></div><div class="stat"><strong>${today}</strong><p>今日自评次数</p></div></div>
-    <div class="section-heading"><h2>选择复习模块</h2><a href="#syllabus">查看完整考纲 →</a></div><div class="module-grid">${modules.map(moduleCard).join('')}</div>
-    <section class="panel source-callout"><div><span class="eyebrow">推荐复习步骤</span><h2>读一个主题，练几道卡片，隔天再回忆</h2><p>模块中的每个考点都连着考纲回忆题或学生总结回忆题。答完后给自己打分，系统会把需要巩固的题排到后面复习。</p></div><a class="text-link" href="#practice">进入练习 →</a></section>`;
-}
-
-function noteBlock(note) {
-  const bookRefs = content.books.flatMap(book => book.refs.filter(ref => ref.noteId === note.id).map(ref => ({ ...ref, book: book.title })));
-  return `<details class="note-accordion"><summary><span>${esc(note.title)}</span><small>${esc(sourceLabel(note.source))} · 展开总结</small></summary>
-    <div class="student-note-text">${esc(note.text)}</div><div class="source-caption">来源：${esc(sourceLabel(note.source))} · 学生自编或AI辅助整理，请结合考纲理解</div>
-    ${bookRefs.map(ref => `<aside class="book-check"><b>教材辅助核对 · ${esc(ref.book)} · ${esc(ref.title)}</b><span>${esc(ref.location)}</span><p>${esc(ref.text)}</p></aside>`).join('')}</details>`;
-}
-
-function pointCard(point) {
-  const related = questionsForPoint(point.id);
-  return `<a class="unit-card" href="#topic/${point.id}"><div class="unit-top"><span>${esc(point.id)}</span>${statusPill(point.id)}</div>
-    <h3>${esc(point.section)}</h3><p>${esc(point.text.slice(0, 145))}${point.text.length > 145 ? '…' : ''}</p>
-    <small>${related.length} 道练习 · 对应考纲</small></a>`;
-}
-
-function renderModule(id) {
-  const module = moduleById(id);
-  if (!module) return empty('没有找到这个模块', '返回总览继续复习。', '<a class="button" href="#home">返回总览</a>');
-  const modulePointList = modulePoints(id);
-  const moduleNotes = content.notes.filter(note => note.module === id);
-  const due = questions.filter(question => question.module === id && dueQuestions().some(item => item.id === question.id)).length;
-  return `${head(esc(module.code), esc(module.title), `${esc(module.description)} · ${due} 道练习待复习`, '<a class="button" href="#practice">开始练习 →</a>')}
-    <section class="module-intro panel"><div class="module-intro-meta"><span class="eyebrow">本模块练习路线</span><b>${modulePointList.length} 个考点 · ${questions.filter(q => q.module === id).length} 道练习</b></div><p>先选考点读范围，再做对应练习。作答后展开参考内容，按“还不会、有点模糊、基本会答、能举一反三”自评。</p></section>
-    <div class="section-heading"><h2>考纲考点与练习</h2><span>${modulePointList.filter(point => pointStatus(point.id) === 2).length}/${modulePointList.length} 个考点已掌握</span></div>
-    <div class="unit-grid">${modulePointList.map(pointCard).join('')}</div>
-    ${moduleNotes.length ? `<div class="section-heading notes-heading"><h2>上届学生总结</h2><span>与本模块考点对应</span></div><div class="notes-stack">${moduleNotes.map(noteBlock).join('')}</div>` : ''}
-    ${id === 'program' ? '<section class="notice">341 程序设计按考纲保留练习卡和范围说明；指定的三份学生总结中没有程序设计笔记。</section>' : ''}`;
-}
-
-function questionRows(list) {
-  return `<div class="question-list">${list.map(question => {
-    const review = reviewState(question.id);
-    const due = !review || review.due <= Date.now();
-    return `<a class="question-row" href="#question/${question.id}"><span class="question-marker ${review?.quality >= 2 ? 'mastered' : review ? 'seen' : ''}">${review?.quality >= 2 ? '✓' : review ? '·' : '○'}</span><div class="question-copy"><div class="tag-row"><span class="tag subtle">${esc(question.kind)}</span>${due ? '<span class="tag related">待复习</span>' : '<span class="tag subtle">已安排</span>'}</div><h3>${esc(question.prompt)}</h3><p>考纲：${question.syllabusIds.map(id => esc(pointById(id)?.id)).join(' · ')} · 来源：${esc(sourceLabel(question.sourceId))}</p></div><span class="arrow">↗</span></a>`;
-  }).join('')}</div>`;
-}
-
-function renderTopic(id) {
-  const point = pointById(id);
-  if (!point) return empty('没有找到这个考点', '请从模块重新选择。', '<a class="button" href="#syllabus">打开考纲</a>');
-  const module = moduleById(point.module);
-  const relatedNotes = pointNotes(id);
-  const relatedQuestions = questionsForPoint(id);
-  return `${head(`${esc(module.code)} · ${esc(module.title)}`, esc(point.section), '先尝试作答，再核对考纲范围和学生总结。', `<a class="button secondary" href="#module/${module.id}">返回模块</a>`)}
-    <section class="panel point-detail"><div class="section-heading"><h2>对应考纲</h2>${statusPill(point.id)}</div><blockquote>${esc(point.text)}</blockquote><p class="fine-print">考纲编号：${esc(point.id)} · 以下练习均为按考纲和指定总结整理的学习卡，不是历年真题。</p></section>
-    ${relatedNotes.length ? `<div class="section-heading"><h2>相关学生总结</h2><span>${relatedNotes.length} 个章节</span></div><div class="notes-stack">${relatedNotes.map(noteBlock).join('')}</div>` : empty('当前指定总结没有覆盖这条考点', '先以考纲范围为准，再通过练习卡检查自己能否完整复述。')}
-    <div class="section-heading"><h2>本考点练习</h2><span>${relatedQuestions.length} 道 · 先作答再核对</span></div>${questionRows(relatedQuestions)}
-    <section class="panel own-notes"><h2>我的理解与错因</h2><p>写下自己的答题框架、记忆线索或需要补充的例子。</p><textarea data-note="${esc(point.id)}" rows="5" maxlength="8000" placeholder="这里记录的内容会自动保存在当前浏览器。">${esc(state.notes[point.id] || '')}</textarea><span class="autosave-label">自动保存</span></section>`;
-}
-
-function renderSyllabus() {
-  return `${head('SYLLABUS MAP', '考纲地图', '逐条浏览341与821考试范围，并从考点直接进入练习。')}${modules.map(module => `<section class="panel syllabus-module"><div class="section-heading"><div><span class="eyebrow">${esc(module.code)}</span><h2>${esc(module.title)}</h2></div><span>${modulePoints(module.id).length} 个考点</span></div><div class="syllabus-list">${modulePoints(module.id).map(point => `<a href="#topic/${point.id}" class="syllabus-row"><span class="syllabus-code">${esc(point.id)}</span><span><b>${esc(point.section)}</b><small>${esc(point.text.slice(0, 165))}${point.text.length > 165 ? '…' : ''}</small></span>${statusPill(point.id)}<span class="arrow">↗</span></a>`).join('')}</div></section>`).join('')}`;
-}
-
-function practiceQueue() {
-  const now = Date.now();
-  const unseen = questions.filter(question => !state.reviews[question.id]);
-  const due = questions.filter(question => state.reviews[question.id]?.due <= now)
-    .sort((a, b) => state.reviews[a.id].due - state.reviews[b.id].due);
-  return [...due, ...unseen];
-}
-
-function renderPractice() {
-  const queue = practiceQueue();
-  if (!practiceQuestionId || !queue.some(question => question.id === practiceQuestionId)) practiceQuestionId = queue[0]?.id || null;
-  const question = questionById(practiceQuestionId);
-  if (!question) return `${head('ACTIVE RECALL', '今日练习完成。', '待复习卡片已经做完，已安排的卡片会在下次到期时出现。')}${empty('现在可以休息一下', '也可以回模块学习新考点。', '<a class="button" href="#home">返回学习总览</a>')}`;
-  const position = queue.findIndex(item => item.id === question.id) + 1;
-  return `${head('ACTIVE RECALL', '主动回忆', '先自己组织答案，再展开参考内容。自评会决定这道卡片下次出现的时间。')}
-    <section class="panel practice-card"><div class="practice-counter"><span>${esc(moduleById(question.module)?.code)} · ${esc(moduleById(question.module)?.title)}</span><span>队列 ${position} / ${queue.length}</span></div>
-      <div class="tag-row"><span class="tag subtle">${esc(question.kind)}</span><span class="tag subtle">资料：${esc(sourceLabel(question.sourceId))}</span></div><h2>${esc(question.prompt)}</h2>
-      <textarea class="answer-draft" data-draft="${esc(question.id)}" rows="6" maxlength="12000" placeholder="先在这里写下答案要点，也可以先口头回忆。">${esc(state.drafts[question.id] || '')}</textarea>
-      ${answerShown ? `<div class="revealed"><h3>参考内容与考纲对应</h3><div class="answer-body">${esc(question.answer)}</div><p class="mapping-line"><b>考纲：</b>${question.syllabusIds.map(id => `<a href="#topic/${id}">${esc(pointById(id)?.section || id)}</a>`).join('、')}</p>
-        ${question.noteIds.length ? `<p class="mapping-line"><b>学生总结：</b>${question.noteIds.map(id => `<a href="#topic/${content.noteMappings[id]?.[0]}">${esc(content.notes.find(note => note.id === id)?.title)}</a>`).join('、')}</p>` : ''}
-        <section class="variation-box"><h3>举一反三</h3><p>${esc(question.variationPrompt)}</p><textarea data-variation="${esc(question.id)}" rows="4" maxlength="6000" placeholder="尝试把这个知识点迁移到新情境。">${esc(state.variations?.[question.id] || '')}</textarea>${variationShown ? `<div class="variation-guide"><b>作答检查思路</b><p>${esc(question.variationGuide)}</p></div>` : button('查看迁移思路', 'show-variation')}</section>
-        <div class="grade-buttons">${[0, 1, 2, 3].map(quality => `<button class="grade" data-action="grade" data-id="${esc(question.id)}" data-quality="${quality}"><b>${['还不会', '有点模糊', '基本会答', '能举一反三'][quality]}</b><span>${['约10分钟后再练', '明天再练', '3天后再练', '7天后再练'][quality]}</span></button>`).join('')}</div></div>` : button('展开参考内容', 'reveal-answer', question.id)}
-      <p class="fine-print">这套卡片按考纲与指定总结整理，不是历年真题或官方答案。</p></section>`;
-}
-
-function renderProgress() {
-  const mastered = points.filter(point => pointStatus(point.id) === 2).length;
-  const inProgress = points.filter(point => pointStatus(point.id) === 1).length;
-  const history = state.history.slice(-10).reverse();
-  return `${head('YOUR PROGRESS', '复习记录', '查看各模块掌握情况，管理每日目标和学习备份。')}
-    <div class="stats-grid"><div class="stat"><strong>${mastered}</strong><p>已掌握考点</p></div><div class="stat"><strong>${inProgress}</strong><p>正在复习</p></div><div class="stat"><strong>${dueQuestions().length}</strong><p>待复习卡片</p></div><div class="stat"><strong>${state.history.length}</strong><p>累计自评</p></div></div>
-    <div class="section-heading"><h2>模块进度</h2></div><div class="module-grid progress-modules">${modules.map(module => { const list = modulePoints(module.id), count = list.filter(point => pointStatus(point.id) === 2).length; return `<section class="panel progress-module"><span class="eyebrow">${esc(module.code)}</span><h2>${esc(module.title)}</h2><progress value="${count}" max="${Math.max(list.length, 1)}"></progress><p>${count} / ${list.length} 个考点已掌握</p><a class="text-link" href="#module/${module.id}">继续复习 →</a></section>`; }).join('')}</div>
-    <section class="panel goal-panel"><h2>每日复习目标</h2><form id="goal-form" class="goal-form"><label for="goal">每天完成</label><input id="goal" name="goal" type="number" min="1" max="100" value="${state.goal}"><span>道练习</span><button class="button secondary">保存目标</button></form><p class="fine-print">今日已自评 ${state.history.filter(item => new Date(item.at).toDateString() === new Date().toDateString()).length} 次。</p></section>
-    <section class="panel history-panel"><h2>最近自评</h2>${history.length ? `<div class="history-list">${history.map(item => `<p>${new Date(item.at).toLocaleString('zh-CN')} · ${esc(questionById(item.id)?.prompt || '练习卡')} · ${['还不会', '有点模糊', '基本会答', '能举一反三'][item.quality]}</p>`).join('')}</div>` : '<p class="muted">完成练习并自评后，这里会显示记录。</p>'}</section>
-    <section class="panel backup-panel"><div><h2>学习数据备份</h2><p>备份包含复习评价、作答草稿、个人笔记和举一反三练习记录。清除浏览器数据或更换设备前，请先导出。</p><p class="fine-print">数据保存在当前浏览器，不会自动同步到其他设备。</p></div><div class="button-row">${button('↓ 导出备份', 'export')}${button('↑ 导入备份', 'import', '', '', 'button secondary')}</div></section>`;
-}
-
-function render() {
-  const rawRoute = location.hash.slice(1) || 'home';
-  const [route, id] = rawRoute.split('/');
-  const labels = { home: '学习总览', module: '模块学习', topic: '考点练习', question: '题目练习', syllabus: '考纲地图', practice: '主动回忆', progress: '复习记录' };
-  $('#breadcrumb').textContent = labels[route] || labels.home;
-  $('#nav').innerHTML = `<a class="${route === 'home' ? 'active' : ''}" href="#home"><span class="nav-icon">◫</span>学习总览</a><a class="${route === 'syllabus' || route === 'topic' ? 'active' : ''}" href="#syllabus"><span class="nav-icon">◎</span>考纲地图</a>${modules.map((module, index) => `<a class="${route === 'module' && id === module.id ? 'active' : ''}" href="#module/${module.id}"><span class="nav-icon">${['〈/〉', '✧', '❧', '▦'][index]}</span>${esc(module.title)}</a>`).join('')}<a class="${route === 'practice' || route === 'question' ? 'active' : ''}" href="#practice"><span class="nav-icon">▷</span>主动回忆</a><a class="${route === 'progress' ? 'active' : ''}" href="#progress"><span class="nav-icon">▥</span>复习记录</a>`;
-  $('#side-courses').innerHTML = modules.map(module => `<a href="#module/${module.id}"><b>${esc(module.code)}</b><span>${esc(module.title)}</span></a>`).join('');
-  const pages = { home: renderHome, syllabus: renderSyllabus, practice: renderPractice, progress: renderProgress };
-  let html;
-  if (route === 'module') html = renderModule(id);
-  else if (route === 'topic') html = renderTopic(id);
-  else if (route === 'question') html = renderQuestion(id);
-  else html = (pages[route] || renderHome)();
-  $('#main').innerHTML = html;
-  document.title = `${labels[route] || labels.home} · 知禾`;
-  $('#sidebar').classList.remove('open');
-  $('#menu-toggle').setAttribute('aria-expanded', 'false');
-}
-
-function renderQuestion(id) {
-  const question = questionById(id);
-  if (!question) return empty('没有找到这道练习', '请从对应考点重新进入。', '<a class="button" href="#home">返回总览</a>');
-  practiceQuestionId = id;
-  const module = moduleById(question.module);
-  const review = reviewState(id);
-  const dueDate = review?.due ? new Date(review.due).toLocaleString('zh-CN') : '首次练习';
-  return `${head(`${esc(module.code)} · ${esc(module.title)}`, '考点练习', `来源：${esc(sourceLabel(question.sourceId))} · ${review ? `下次复习：${dueDate}` : '新卡片'}`, `<a class="button secondary" href="#topic/${question.pointId}">返回考点</a>`)}
-    <section class="panel practice-card"><div class="tag-row"><span class="tag subtle">${esc(question.kind)}</span><span class="tag subtle">考纲 ${question.syllabusIds.map(id => esc(id)).join('、')}</span></div><h2>${esc(question.prompt)}</h2>
-      <textarea class="answer-draft" data-draft="${esc(id)}" rows="6" maxlength="12000" placeholder="先写下你的答案或答题框架。">${esc(state.drafts[id] || '')}</textarea>
-      ${answerShown ? `<div class="revealed"><h3>参考内容</h3><div class="answer-body">${esc(question.answer)}</div><p class="mapping-line"><b>对应考纲：</b>${question.syllabusIds.map(pointId => `<a href="#topic/${pointId}">${esc(pointById(pointId)?.section)}</a>`).join('、')}</p><p class="mapping-line"><b>资料来源：</b>${esc(sourceLabel(question.sourceId))}</p>
-        <section class="variation-box"><h3>举一反三</h3><p>${esc(question.variationPrompt)}</p><textarea data-variation="${esc(id)}" rows="4" maxlength="6000" placeholder="尝试迁移到新的条件或情境。">${esc(state.variations?.[id] || '')}</textarea>${variationShown ? `<div class="variation-guide"><b>自查思路</b><p>${esc(question.variationGuide)}</p></div>` : button('展开自查思路', 'show-variation')}</section>
-        <div class="grade-buttons">${[0, 1, 2, 3].map(quality => `<button class="grade" data-action="grade" data-id="${esc(id)}" data-quality="${quality}"><b>${['还不会', '有点模糊', '基本会答', '能举一反三'][quality]}</b><span>${['约10分钟后再练', '明天再练', '3天后再练', '7天后再练'][quality]}</span></button>`).join('')}</div></div>` : button('展开参考内容', 'reveal-answer', id)}
-      <p class="fine-print">整理练习，非历年真题；主观题请按考纲和总结自我核对。</p></section>`;
-}
-
-function scheduleReview(previous, quality) {
-  const now = Date.now();
-  const stage = Math.min(5, Math.max(0, (previous?.stage || 0) + (quality === 0 ? -6 : quality === 1 ? 0 : quality === 2 ? 1 : 2)));
-  const days = [1, 1, 3, 7, 14, 30][stage];
-  return { stage, quality, due: now + (quality === 0 ? 10 * 60 * 1000 : days * 86400000), reviewedAt: now, count: (previous?.count || 0) + 1 };
-}
-
-function exportBackup() {
-  const file = new Blob([JSON.stringify({ ...state, exportedAt: new Date().toISOString() }, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(file);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `知禾学习备份-${new Date().toISOString().slice(0, 10)}.json`;
-  link.click();
-  URL.revokeObjectURL(url);
-  toast('备份已导出。');
-}
-
-document.addEventListener('click', event => {
-  const control = event.target.closest('[data-action]');
-  if (!control) return;
-  const { action, id } = control.dataset;
-  if (action === 'reveal-answer') { practiceQuestionId = id; answerShown = true; render(); return; }
-  if (action === 'show-variation') { variationShown = true; render(); return; }
-  if (action === 'grade') {
-    const quality = Number(control.dataset.quality);
-    state.reviews[id] = scheduleReview(state.reviews[id], quality);
-    state.history.push({ id, quality, at: Date.now() });
-    state.history = state.history.slice(-20000);
-    saveState();
-    const queue = practiceQueue();
-    practiceQuestionId = queue[0]?.id || null;
-    answerShown = false;
-    variationShown = false;
-    if (location.hash.startsWith('#practice')) render();
-    else location.hash = 'practice';
-    toast('已记录自评，系统安排了下次复习。');
-    return;
-  }
-  if (action === 'export') { exportBackup(); return; }
-  if (action === 'import') { $('#backup-file').click(); }
-});
-
-document.addEventListener('input', event => {
-  const field = event.target;
-  if (field.matches('[data-draft]')) {
-    state.drafts[field.dataset.draft] = field.value;
-    saveState();
-  }
-  if (field.matches('[data-note]')) {
-    state.notes[field.dataset.note] = field.value;
-    saveState();
-  }
-  if (field.matches('[data-variation]')) {
-    state.variations ||= {};
-    state.variations[field.dataset.variation] = field.value;
-    saveState();
-  }
-});
-
-document.addEventListener('submit', event => {
-  if (event.target.id !== 'goal-form') return;
-  event.preventDefault();
-  state.goal = Math.max(1, Math.min(100, Number(new FormData(event.target).get('goal')) || 12));
-  saveState();
-  toast('每日目标已更新。');
-});
-
-$('#backup-file').addEventListener('change', async event => {
-  const file = event.target.files[0];
-  if (!file) return;
-  try {
-    const incoming = JSON.parse(await file.text());
-    if (incoming.version !== 1 || typeof incoming.reviews !== 'object' || typeof incoming.notes !== 'object') throw new Error('文件不是知禾学习备份。');
-    if (!confirm('导入备份将合并学习记录和个人笔记，继续吗？')) return;
-    state.reviews = { ...state.reviews, ...incoming.reviews };
-    state.drafts = { ...state.drafts, ...(incoming.drafts || {}) };
-    state.notes = { ...state.notes, ...incoming.notes };
-    state.variations = { ...state.variations, ...(incoming.variations || {}) };
-    state.history = [...state.history, ...(incoming.history || [])].slice(-20000);
-    state.goal = incoming.goal || state.goal;
-    saveState();
-    render();
-    toast('学习备份已导入。');
-  } catch (error) {
-    toast(`导入失败：${error.message}`);
-  } finally {
-    event.target.value = '';
-  }
-});
-
-$('#menu-toggle').addEventListener('click', () => {
-  const open = $('#sidebar').classList.toggle('open');
-  $('#menu-toggle').setAttribute('aria-expanded', String(open));
-});
-document.addEventListener('keydown', event => {
-  if (event.key === 'Escape') $('#sidebar').classList.remove('open');
-});
-window.addEventListener('hashchange', () => {
-  answerShown = false;
-  variationShown = false;
-  render();
-});
-
-render();
+document.addEventListener('click',e=>{if(e.target.closest('a.skip')){e.preventDefault();$('#main').focus();return;}const b=e.target.closest('[data-action]');if(!b)return;const id=b.dataset.id;switch(b.dataset.action){
+ case'bookmark':{const i=state.bookmarks.indexOf(id);if(i<0)state.bookmarks.push(id);else state.bookmarks.splice(i,1);save();b.textContent=i<0?'★ 已收藏':'☆ 收藏';toast(i<0?'已加入收藏':'已取消收藏');break;}
+ case'choose':session.selected=Number(b.dataset.index);render();break;
+ case'reveal':session.reveal=true;render();break;
+ case'grade':{if(!questions[id]||!eligible(questions[id]))break;const quality=Number(b.dataset.quality);state.reviews[id]=schedule(state.reviews[id],quality);state.history.push({id,quality,at:Date.now()});state.history=state.history.slice(-20000);save();if(session&&session.ids[session.index]===id){session.grades.push(quality);session.index++;session.reveal=false;session.selected=null;}render();toast('已记录，下次复习：'+(quality===0?'约10分钟后':date(state.reviews[id].due)));break;}
+ case'restart':session=null;if(location.hash==='#practice')render();else location.hash='practice';break;
+ case'export':{const blob=new Blob([JSON.stringify({...state,exportedAt:new Date().toISOString()},null,2)],{type:'application/json'});const u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download=`知禾复习备份-${dayKey()}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);toast('备份已导出，请妥善保存。');break;}
+ case'import':$('#backup-file').click();break;
+ case'print':window.print();break;
+ case'reload':location.reload();break;
+}});
+document.addEventListener('input',e=>{const el=e.target;if(el.matches('[data-save]')){state[el.dataset.save][el.dataset.id]=el.value;save();}});
+document.addEventListener('submit',e=>{const form=e.target;if(!['bank-filter','library-filter','syllabus-filter','goal-form'].includes(form.id))return;e.preventDefault();const values=new FormData(form);if(form.id==='goal-form'){const n=Number(values.get('goal'));if(Number.isInteger(n)&&n>=1&&n<=100){state.goal=n;save();toast('每日目标已保存');}return;}const p=new URLSearchParams();for(const [key,value]of values)if(value||key==='status')p.set(key,value);location.hash=(form.id==='bank-filter'?'bank':form.id==='library-filter'?'library':'syllabus')+'?'+p;});
+$('#backup-file').addEventListener('change',async e=>{const file=e.target.files[0];if(!file)return;try{if(file.size>15*1024*1024)throw new Error('备份超过15MB，请选择本系统导出的文件。');const incoming=normalizeBackup(JSON.parse(await file.text()),new Set(data.questions.map(q=>q.id)));state=mergeState(state,incoming);save();await render();toast('备份已合并，已有笔记保留。');}catch(err){toast('导入失败：'+err.message);}e.target.value='';});
+$('#menu-toggle').addEventListener('click',()=>{const open=$('#sidebar').classList.toggle('open');$('#menu-toggle').setAttribute('aria-expanded',String(open));});
+document.addEventListener('keydown',e=>{if(e.key==='/'&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)){e.preventDefault();if(location.hash.startsWith('#bank'))$('#bank-search')?.focus();else{location.hash='bank';setTimeout(()=>$('#bank-search')?.focus(),100);}}if(e.key==='Escape'){$('#sidebar').classList.remove('open');$('#menu-toggle').setAttribute('aria-expanded','false');}});
+window.addEventListener('hashchange',()=>{if(data)render();});
+window.addEventListener('storage',e=>{if(e.key===KEY&&e.newValue&&data){try{state=mergeState(state,normalizeBackup(JSON.parse(e.newValue),new Set(data.questions.map(q=>q.id))));toast('已同步此浏览器另一标签页的记录，切换页面可查看。');}catch{}}});
+try{const response=await fetch('/content/catalog.json');if(!response.ok)throw new Error('题库文件读取失败');data=await response.json();questions=Object.fromEntries(data.questions.map(q=>[q.id,q]));topics=Object.fromEntries(data.topics.map(t=>[t.id,t]));sourceMap=Object.fromEntries(data.sources.map(s=>[s.id,s]));syllabusMap=Object.fromEntries(data.syllabus.map(s=>[s.id,s]));moduleMap=Object.fromEntries(data.modules.map(m=>[m.id,m]));try{const saved=localStorage.getItem(KEY);if(saved)state=normalizeBackup(JSON.parse(saved),new Set(Object.keys(questions)));}catch{toast('本地记录读取失败。可到学习记录页导入备份。');}await render();}catch(error){$('#main').innerHTML=empty('学习资料暂时无法载入',esc(error.message),button('重新加载','reload'));}

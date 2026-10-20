@@ -5,10 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "node tools/build.mjs",
-    "dev": "npm run build && node tools/serve.mjs",
+    "dev": "node tools/serve.mjs",
     "deploy": "npm run build && npx wrangler pages deploy dist --project-name zhihe"
   },
-  "engines": {
-    "node": ">=20"
-  }
+  "engines": { "node": ">=20" }
 }
