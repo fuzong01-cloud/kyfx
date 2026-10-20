@@ -1,0 +1,8 @@
+{
+  "name": "kyfx-study-template",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {"build":"node tools/build.mjs","dev":"npm run build && node tools/serve.mjs","deploy":"npm run build && npx wrangler pages deploy dist --project-name kyfx"},
+  "engines": {"node":">=20"}
+}

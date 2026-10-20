@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#193f35"><meta name="description" content="可自定义课程、知识点和练习题的个人复习工作台。"><title>知序 · 个人复习工作台</title><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/template.css"><script type="module" src="/app.js"></script>
+</head>
+<body>
+<a href="#main" class="skip">跳到内容</a>
+<aside class="sidebar" id="sidebar"><a class="brand" href="#home"><img src="/favicon.svg" alt="" width="38" height="38"><span>知序<small>把复习变成自己的节奏</small></span></a><div class="edition"><span class="dot"></span>个人学习空间</div><nav id="nav" aria-label="主导航"></nav><div class="side-course"><div class="eyebrow">我的课程</div><div id="side-courses"></div><button class="side-add" data-action="new-module">＋ 添加课程</button></div><div class="side-bottom"><span class="save-dot"></span><span>数据保存在当前浏览器<br><a href="#progress">备份与数据 →</a></span></div></aside>
+<div class="workspace"><header class="topbar"><button class="icon-button menu-toggle" id="menu-toggle" aria-label="打开导航" aria-expanded="false">☰</button><span id="breadcrumb">学习工作台</span><a class="top-search" href="#bank"><span>⌕</span> 搜索题目与知识点 <kbd>/</kbd></a><a class="account-entry" href="#progress">本地学习空间</a><span class="top-year">自定义 <span>复习中</span></span></header><main id="main" tabindex="-1"></main><footer>知序 · 每一步积累都算数 <a href="#progress">了解数据保存方式</a></footer></div>
+<div id="toast" role="status" aria-live="polite"></div><input type="file" id="backup-file" accept=".json,application/json" hidden><noscript>本复习系统需要启用 JavaScript。</noscript>
+</body></html>
